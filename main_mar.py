@@ -7,6 +7,8 @@ from pathlib import Path
 
 import torch
 import torch.backends.cudnn as cudnn
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
@@ -20,6 +22,21 @@ from models.vae import AutoencoderKL
 from models import mar
 from engine_mar import train_one_epoch, evaluate
 import copy
+
+
+def setup(rank: int, world_size: int) -> None:
+    """Initialise the distributed process group for NCCL-based training."""
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "10086")
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
+
+def cleanup() -> None:
+    """Tear down the distributed process group when training is finished."""
+
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def get_args_parser():
@@ -133,9 +150,12 @@ def get_args_parser():
     return parser
 
 
-def main(args):
-    misc.init_distributed_mode(args)
+def build_parser():
+    return get_args_parser()
 
+
+def train(args):
+    
     print('job dir: {}'.format(os.path.dirname(os.path.realpath(__file__))))
     print("{}".format(args).replace(', ', ',\n'))
 
@@ -302,9 +322,45 @@ def main(args):
     print('Training time {}'.format(total_time_str))
 
 
-if __name__ == '__main__':
-    args = get_args_parser()
-    args = args.parse_args()
+def run_training(rank: int, world_size: int, args) -> None:
+    setup(rank, world_size)
+
+    torch.cuda.set_device(rank)
+    args.rank = rank
+    args.world_size = world_size
+    args.gpu = rank
+    args.distributed = True
+    args.dist_url = f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}"
+    args.dist_backend = "nccl"
+
+    try:
+        train(args)
+    finally:
+        cleanup()
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    now = datetime.datetime.now()
+    time_str = now.strftime("%Y_%m_%d_%H_%M_%S")
+    model_name = getattr(args, "model", None) or getattr(args, "model_name", "model")
+    args.output_dir = os.path.join(args.output_dir, model_name.replace('/', '_'), time_str)
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     args.log_dir = args.output_dir
-    main(args)
+
+    world_size = torch.cuda.device_count()
+    if world_size < 1:
+        raise ValueError("需要至少一个GPU来运行此脚本")
+
+    mp.spawn(
+        run_training,
+        args=(world_size, args),
+        nprocs=world_size,
+        join=True,
+    )
+
+
+if __name__ == "__main__":
+    main()
