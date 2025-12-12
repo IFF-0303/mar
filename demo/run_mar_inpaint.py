@@ -16,6 +16,7 @@ from typing import Iterable, TYPE_CHECKING
 import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from torchvision import transforms
 from torchvision.utils import save_image
 
@@ -154,7 +155,7 @@ def load_models(
 def format_mask(mask: torch.Tensor, model: torch.nn.Module) -> torch.Tensor:
     """Resize mask to the MAR token grid and flatten."""
     resized = F.interpolate(
-        mask.unsqueeze(0).unsqueeze(0),
+        mask.unsqueeze(0),
         size=(model.seq_h, model.seq_w),
         mode="nearest",
     )
@@ -283,9 +284,9 @@ def main() -> None:
         ]
     )
 
-    image = preprocess(args.image.open("rb").convert("RGB")).unsqueeze(0).to(device)
+    image = preprocess(Image.open(args.image).convert("RGB")).unsqueeze(0).to(device)
 
-    mask_image = transforms.Lambda(lambda img: center_crop_arr(img, 256))(args.mask.open("rb").convert("L"))
+    mask_image = transforms.Lambda(lambda img: center_crop_arr(img, 256))(Image.open(args.mask).convert("L"))
     mask_tensor = transforms.ToTensor()(mask_image).to(device)
     mask_tokens = format_mask(mask_tensor, model)
 
