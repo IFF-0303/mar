@@ -8,15 +8,28 @@ flow while keeping visible regions fixed.
 from __future__ import annotations
 
 import argparse
-import importlib
 import math
 import sys
 from pathlib import Path
 from typing import Iterable, TYPE_CHECKING
 
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torchvision import transforms
+from torchvision.utils import save_image
+
+project_root = Path(__file__).resolve().parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+from models import mar
+from models.vae import AutoencoderKL
+from util import download
+from util.crop import center_crop_arr
+
 if TYPE_CHECKING:
-    import torch
-    from models.vae import AutoencoderKL
+    from torch import Tensor
 
 
 MODEL_CONFIGS = {
@@ -106,20 +119,15 @@ def parse_args() -> argparse.Namespace:
 
 
 def ensure_checkpoints(model_type: str, overwrite: bool = False) -> None:
-    download_module = importlib.import_module("util.download")
-    download_module.download_pretrained_vae(overwrite=overwrite)
-    getattr(download_module, MODEL_CONFIGS[model_type]["download_fn"])(overwrite=overwrite)
+    download.download_pretrained_vae(overwrite=overwrite)
+    getattr(download, MODEL_CONFIGS[model_type]["download_fn"])(overwrite=overwrite)
 
 
 def load_models(
     model_type: str,
     num_sampling_steps_diffloss: int,
-    device: "torch.device",
-) -> tuple["torch.nn.Module", "AutoencoderKL"]:
-    import torch
-    from models import mar
-    from models.vae import AutoencoderKL
-
+    device: torch.device,
+) -> tuple[torch.nn.Module, AutoencoderKL]:
     config = MODEL_CONFIGS[model_type]
     model = mar.__dict__[model_type](
         buffer_size=64,
@@ -143,11 +151,8 @@ def load_models(
     return model, vae
 
 
-def format_mask(mask: "torch.Tensor", model: "torch.nn.Module") -> "torch.Tensor":
+def format_mask(mask: torch.Tensor, model: torch.nn.Module) -> torch.Tensor:
     """Resize mask to the MAR token grid and flatten."""
-    import torch
-    import torch.nn.functional as F
-
     resized = F.interpolate(
         mask.unsqueeze(0).unsqueeze(0),
         size=(model.seq_h, model.seq_w),
@@ -157,21 +162,18 @@ def format_mask(mask: "torch.Tensor", model: "torch.nn.Module") -> "torch.Tensor
 
 
 def sample_tokens_inpaint(
-    model: "torch.nn.Module",
-    tokens: "torch.Tensor",
-    mask: "torch.Tensor",
+    model: torch.nn.Module,
+    tokens: torch.Tensor,
+    mask: torch.Tensor,
     *,
     num_iter: int,
     cfg: float,
     cfg_schedule: str,
-    labels: "torch.Tensor | None",
+    labels: torch.Tensor | None,
     temperature: float,
     progress: bool,
-) -> "torch.Tensor":
+) -> torch.Tensor:
     """Iteratively fill masked token positions while keeping visible regions fixed."""
-    import numpy as np
-    import torch
-
     bsz, seq_len, _ = tokens.shape
     device = tokens.device
     mask = mask.clone().to(device)
@@ -264,36 +266,10 @@ def sample_tokens_inpaint(
 def main() -> None:
     args = parse_args()
 
-    project_root = Path(__file__).resolve().parent.parent
-    if str(project_root) not in sys.path:
-        sys.path.insert(0, str(project_root))
-
-    torch_spec = importlib.util.find_spec("torch")
-    if torch_spec is None:
-        raise ModuleNotFoundError(
-            "torch is required to run MAR inference. Please install PyTorch first."
-        )
-    torch = importlib.import_module("torch")
-
-    torchvision_spec = importlib.util.find_spec("torchvision.transforms")
-    if torchvision_spec is None:
-        raise ModuleNotFoundError(
-            "torchvision is required for preprocessing. Please install torchvision first."
-        )
-    transforms = importlib.import_module("torchvision.transforms")
-
-    try:
-        import numpy as np  # type: ignore
-    except ModuleNotFoundError:
-        np = None
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     torch.manual_seed(args.seed)
-    if np is not None:
-        np.random.seed(args.seed)
-    else:
-        print("NumPy is not available; skipping NumPy-specific seeding.")
+    np.random.seed(args.seed)
     torch.set_grad_enabled(False)
 
     ensure_checkpoints(args.model_type, overwrite=args.overwrite_downloads)
@@ -301,7 +277,7 @@ def main() -> None:
 
     preprocess = transforms.Compose(
         [
-            transforms.Lambda(lambda img: importlib.import_module("util.crop").center_crop_arr(img, 256)),
+            transforms.Lambda(lambda img: center_crop_arr(img, 256)),
             transforms.ToTensor(),
             transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
         ]
@@ -309,9 +285,7 @@ def main() -> None:
 
     image = preprocess(args.image.open("rb").convert("RGB")).unsqueeze(0).to(device)
 
-    mask_image = (
-        transforms.Lambda(lambda img: importlib.import_module("util.crop").center_crop_arr(img, 256))
-    )(args.mask.open("rb").convert("L"))
+    mask_image = transforms.Lambda(lambda img: center_crop_arr(img, 256))(args.mask.open("rb").convert("L"))
     mask_tensor = transforms.ToTensor()(mask_image).to(device)
     mask_tokens = format_mask(mask_tensor, model)
 
@@ -321,7 +295,7 @@ def main() -> None:
 
     tokens[:, mask_tokens.bool().squeeze(0)] = 0
 
-    labels = None
+    labels: Tensor | None = None
     if args.class_label is not None:
         labels = torch.tensor([args.class_label], device=device, dtype=torch.long)
 
@@ -341,7 +315,6 @@ def main() -> None:
         reconstructed = vae.decode(reconstructed_tokens / 0.2325)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    save_image = importlib.import_module("torchvision.utils").save_image
     save_image(
         reconstructed,
         args.output,
